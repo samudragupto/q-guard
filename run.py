@@ -9,7 +9,7 @@ from data.feature_engineering import engineer_features, select_top_features
 from data.rebalance import rebalance_dataset
 from training.train import train_model
 from training.losses import get_criterion
-from eval.calibration import expected_calibration_error, brier_score, TemperatureScaling
+from eval.calibration import expected_calibration_error, brier_score, TemperatureScaling, reliability_diagram_data
 from eval.adversarial import evaluate_robustness
 from eval.metrics import robust_evaluation
 from utils import get_device, move_to_device
@@ -50,8 +50,10 @@ def main():
     X_test = move_to_device(torch.tensor(test_df[top_features].values, dtype=torch.float32), device)
     y_test = move_to_device(torch.tensor(test_df[target_col].values, dtype=torch.long), device)
 
+    # Reduce class weight imbalance slightly (cap max weight to prevent overfitting on noise)
     classes = np.unique(y_train.cpu().numpy())
     weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train.cpu().numpy())
+    weights = np.clip(weights, 0.5, 5.0) 
     class_weights = move_to_device(torch.tensor(weights, dtype=torch.float32), device)
 
     print("\nStarting training...", flush=True)
@@ -66,8 +68,7 @@ def main():
         device=device,
         class_weights=class_weights,
         use_focal=True,
-        adv_training=True,
-        adv_method="pgd"
+        adv_training=True
     )
 
     print("\nCalibrating model...", flush=True)
@@ -85,10 +86,14 @@ def main():
         calibrated_probs = temp_scaler.get_calibrated_probs(logits)
         ece = expected_calibration_error(y_val, calibrated_probs)
         brier = brier_score(y_val, calibrated_probs)
+        rel_data = reliability_diagram_data(y_val, calibrated_probs)
+        
     print(f"Calibration - ECE: {ece:.4f}, Brier Score: {brier:.4f}", flush=True)
+    print(f"Reliability Diagram Accuracy Bins: {rel_data['bin_accuracy']}", flush=True)
+    print(f"Reliability Diagram Confidence Bins: {rel_data['bin_confidence']}", flush=True)
     
     print("\nRunning adversarial robustness test (PGD)...", flush=True)
-    robustness_results = evaluate_robustness(model, X_val[:200], y_val[:200], device, criterion, eps=0.1, num_classes=num_classes, threshold=optimal_threshold)
+    robustness_results = evaluate_robustness(model, X_val[:200], y_val[:200], device, threshold=optimal_threshold, eps=0.1)
     print(f"Robustness - Clean Acc: {robustness_results['clean_accuracy']:.4f}, Adv Acc: {robustness_results['adversarial_accuracy']:.4f}", flush=True)
 
     print("\nRunning robust evaluation on test set...", flush=True)

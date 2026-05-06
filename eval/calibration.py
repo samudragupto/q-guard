@@ -1,6 +1,7 @@
 # eval/calibration.py
 import torch
 import torch.nn as nn
+import numpy as np
 
 class TemperatureScaling(nn.Module):
     def __init__(self):
@@ -30,7 +31,6 @@ class TemperatureScaling(nn.Module):
         return torch.softmax(self.forward(logits), dim=-1)
 
 def expected_calibration_error(y_true: torch.Tensor, probs: torch.Tensor, n_bins: int = 10) -> float:
-    import numpy as np
     confidences, predictions = probs.max(dim=-1)
     y_true_np, conf_np, pred_np = y_true.cpu().numpy(), confidences.cpu().numpy(), predictions.cpu().numpy()
     bin_boundaries = np.linspace(0, 1, n_bins + 1)
@@ -46,3 +46,29 @@ def brier_score(y_true: torch.Tensor, probs: torch.Tensor) -> float:
     import torch.nn.functional as F
     y_true_one_hot = F.one_hot(y_true, num_classes=probs.shape[-1]).float()
     return torch.mean((probs - y_true_one_hot) ** 2).item()
+
+def reliability_diagram_data(y_true: torch.Tensor, probs: torch.Tensor, n_bins: int = 10) -> dict:
+    confidences, predictions = probs.max(dim=-1)
+    y_true_np, conf_np, pred_np = y_true.cpu().numpy(), confidences.cpu().numpy(), predictions.cpu().numpy()
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    
+    bin_accuracy = []
+    bin_confidence = []
+    bin_counts = []
+    
+    for i in range(n_bins):
+        in_bin = (conf_np > bin_boundaries[i]) & (conf_np <= bin_boundaries[i+1])
+        count = np.sum(in_bin)
+        bin_counts.append(count)
+        if count > 0:
+            bin_accuracy.append(np.mean(pred_np[in_bin] == y_true_np[in_bin]))
+            bin_confidence.append(np.mean(conf_np[in_bin]))
+        else:
+            bin_accuracy.append(0.0)
+            bin_confidence.append(0.0)
+            
+    return {
+        "bin_accuracy": np.array(bin_accuracy),
+        "bin_confidence": np.array(bin_confidence),
+        "bin_counts": np.array(bin_counts)
+    }

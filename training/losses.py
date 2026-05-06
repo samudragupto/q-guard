@@ -4,14 +4,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha: torch.Tensor = None, gamma: float = 2.0, reduction: str = 'mean'):
+    def __init__(self, alpha: torch.Tensor = None, gamma: float = 2.0, label_smoothing: float = 0.05, reduction: str = 'mean'):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
+        self.label_smoothing = label_smoothing
         self.reduction = reduction
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', label_smoothing=self.label_smoothing)
         pt = torch.exp(-ce_loss)
         
         if self.alpha is not None:
@@ -26,8 +27,8 @@ class FocalLoss(nn.Module):
             return focal_loss.sum()
         return focal_loss
 
-def get_criterion(use_focal: bool, class_weights: torch.Tensor = None, device: torch.device = torch.device("cpu")) -> nn.Module:
+def get_criterion(use_focal: bool, class_weights: torch.Tensor = None, device: torch.device = torch.device("cpu"), label_smoothing: float = 0.05) -> nn.Module:
     weights = class_weights.to(device) if class_weights is not None else None
     if use_focal:
-        return FocalLoss(alpha=weights, gamma=2.0).to(device)
-    return nn.CrossEntropyLoss(weight=weights).to(device)
+        return FocalLoss(alpha=weights, gamma=2.0, label_smoothing=label_smoothing).to(device)
+    return nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing).to(device)

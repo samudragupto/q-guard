@@ -18,7 +18,7 @@ class PredictionOutput(BaseModel):
     label: str
     confidence: float
     uncertainty: float
-    probabilities: dict[str, float]
+    threshold_used: float
 
 class ExplainOutput(BaseModel):
     label: str
@@ -59,20 +59,15 @@ def predict(flow: BatchFlowInput):
     
     results = []
     for i in range(len(flow.batch)):
-        if len(label_classes) == 2:
-            pred = 1 if output["probs"][i][1].item() > optimal_threshold else 0
-            conf = output["probs"][i][pred].item()
-        else:
-            conf, pred = output["probs"][i].max(dim=-1)
-            pred = pred.item()
-            conf = conf.item()
+        attack_prob = output["probs"][i][1].item()
+        pred = 1 if attack_prob >= optimal_threshold else 0
+        conf = output["probs"][i][pred].item()
             
-        probs = {label_classes[j]: output["probs"][i][j].item() for j in range(len(label_classes))}
         results.append(PredictionOutput(
             label=label_classes[pred],
             confidence=conf,
             uncertainty=output["uncertainty"][i].item(),
-            probabilities=probs
+            threshold_used=optimal_threshold
         ))
     return results
 
