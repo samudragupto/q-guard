@@ -1,0 +1,9 @@
+# requirements.txt
+torch
+scikit-learn
+pandas
+numpy
+fastapi
+uvicorn
+pydantic
+shap

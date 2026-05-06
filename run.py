@@ -1,110 +1,103 @@
 # run.py
 import torch
 import pandas as pd
+import numpy as np
+from sklearn.utils.class_weight import compute_class_weight
 from data.data_loader import load_data, split_data
 from data.preprocess import clean_data, normalize_features
 from data.feature_engineering import engineer_features, select_top_features
+from data.rebalance import rebalance_dataset
 from training.train import train_model
-from eval.calibration import expected_calibration_error, brier_score
+from eval.calibration import expected_calibration_error, brier_score, TemperatureScaling
 from eval.adversarial import evaluate_robustness
 from utils import get_device, move_to_device
 
 def main():
-    # Initialize device
     device = get_device()
 
-    # PHASE 1: Data Pipeline
-    print("Loading data...")
+    print("Loading data...", flush=True)
     df = load_data("data.csv", sample_size=50000)
     
-    print("Cleaning data...")
+    print("Cleaning data...", flush=True)
     df = clean_data(df)
     
-    print("Engineering features...")
+    print("Engineering features...", flush=True)
     df = engineer_features(df)
     
-    # Dynamic target column detection
-    possible_targets = ['Attack Type', 'Label', 'Attack_Type', 'Label ']
-    target_col = None
-    for col in possible_targets:
-        if col in df.columns:
-            target_col = col
-            break
+    possible_targets = ['Attack Type', 'Label', 'Attack_Type']
+    target_col = next((col for col in possible_targets if col in df.columns), df.columns[-1])
+    print(f"[DEBUG] Target column found: '{target_col}'", flush=True)
     
-    if target_col is None:
-        target_col = df.columns[-1]
-        print(f"[DEBUG] Standard target columns not found. Assuming last column '{target_col}' is target.")
-    else:
-        print(f"[DEBUG] Target column found: '{target_col}'")
-    
-    # Robust label normalization and encoding
     BENIGN_LABELS = {'BENIGN', 'NORMAL', 'NORMAL TRAFFIC'}
-
-    # Print unique values BEFORE encoding (normalized for display)
     normalized_col = df[target_col].astype(str).str.strip().str.upper()
-    print(f"[DEBUG] Unique values BEFORE encoding: {normalized_col.unique()[:10]}")
+    print(f"[DEBUG] Unique values BEFORE encoding: {normalized_col.unique()[:10]}", flush=True)
 
-    # Convert to binary target (0: Benign, 1: Attack)
-    if pd.api.types.is_numeric_dtype(df[target_col]):
-        if set(df[target_col].unique()) <= {0, 1}:
-            pass  # Already correctly encoded as 0 and 1
-        else:
-            df[target_col] = df[target_col].apply(lambda x: 0 if x == 0 else 1)
+    if pd.api.types.is_numeric_dtype(df[target_col]) and set(df[target_col].unique()) <= {0, 1}:
+        pass
+    elif pd.api.types.is_numeric_dtype(df[target_col]):
+        df[target_col] = df[target_col].apply(lambda x: 0 if x == 0 else 1)
     else:
         df[target_col] = normalized_col.apply(lambda x: 0 if x in BENIGN_LABELS else 1)
 
-    # Print unique values AFTER encoding and class distribution
-    print(f"[DEBUG] Unique values AFTER encoding: {df[target_col].unique()}")
-    print(f"[DEBUG] Class distribution:\n{df[target_col].value_counts()}")
+    print(f"[DEBUG] Unique values AFTER encoding: {df[target_col].unique()}", flush=True)
+    print(f"[DEBUG] Class distribution:\n{df[target_col].value_counts()}", flush=True)
 
-    # Safety check for single class dataset
     if df[target_col].nunique() < 2:
         raise ValueError("Dataset must contain both benign and attack samples")
     
-    print("Selecting top 8 features...")
-    top_features = select_top_features(df, target_col, n_features=8)
+    print("\nRebalancing dataset...", flush=True)
+    df = rebalance_dataset(df, target_col, ratio=5)
     
+    print("Selecting top 8 features...", flush=True)
+    top_features = select_top_features(df, target_col, n_features=8)
     df, scaler = normalize_features(df, top_features)
     
     train_df, val_df, test_df = split_data(df, target_col)
     
-    # Move tensors to device
     X_train = move_to_device(torch.tensor(train_df[top_features].values, dtype=torch.float32), device)
     y_train = move_to_device(torch.tensor(train_df[target_col].values, dtype=torch.long), device)
-    
     X_val = move_to_device(torch.tensor(val_df[top_features].values, dtype=torch.float32), device)
     y_val = move_to_device(torch.tensor(val_df[target_col].values, dtype=torch.long), device)
 
-    # PHASE 6: Training Pipeline
-    print("\nStarting training...")
+    # Compute Class Weights
+    classes = np.unique(y_train.cpu().numpy())
+    weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train.cpu().numpy())
+    class_weights = move_to_device(torch.tensor(weights, dtype=torch.float32), device)
+    print(f"[DEBUG] Class weights: {class_weights}", flush=True)
+
+    print("\nStarting training...", flush=True)
     model = train_model(
         X_train, y_train, 
         X_val, y_val, 
-        epochs=10,
-        batch_size=32,  
+        epochs=15,
+        batch_size=64,  
         lr=1e-3,
-        patience=3,
-        device=device
+        patience=5,
+        device=device,
+        class_weights=class_weights,
+        adv_training=True
     )
 
-    # PHASE 7: Evaluation + Robustness
-    print("\nEvaluating model...")
+    print("\nCalibrating model...", flush=True)
     model.eval()
+    with torch.no_grad():
+        logits = model(X_val)["logits"]
+        
+    temp_scaler = TemperatureScaling().to(device)
+    temp_scaler.fit(logits, y_val)
     
     with torch.no_grad():
-        test_out = model(X_val)
-        ece = expected_calibration_error(y_val, test_out["probs"])
-        brier = brier_score(y_val, test_out["probs"])
-        
-    print(f"Calibration - ECE: {ece:.4f}, Brier Score: {brier:.4f}")
+        calibrated_probs = torch.softmax(temp_scaler(logits), dim=-1)
+        ece = expected_calibration_error(y_val, calibrated_probs)
+        brier = brier_score(y_val, calibrated_probs)
+    print(f"Calibration - ECE: {ece:.4f}, Brier Score: {brier:.4f}", flush=True)
     
-    print("\nRunning adversarial robustness test on 100 samples...")
-    robustness_results = evaluate_robustness(model, X_val[:100], y_val[:100], eps=0.1, device=device)
-    print(f"Robustness - Clean Acc: {robustness_results['clean_accuracy']:.4f}, Adv Acc: {robustness_results['adversarial_accuracy']:.4f}")
+    print("\nRunning adversarial robustness test...", flush=True)
+    robustness_results = evaluate_robustness(model, X_val[:200], y_val[:200], device, eps=0.1)
+    print(f"Robustness - Clean Acc: {robustness_results['clean_accuracy']:.4f}, Adv Acc: {robustness_results['adversarial_accuracy']:.4f}", flush=True)
     
-    # Save model for API
     torch.save(model.state_dict(), "qguard_weights.pth")
-    print("\nModel saved to qguard_weights.pth")
+    print("\nModel saved to qguard_weights.pth", flush=True)
 
 if __name__ == "__main__":
     main()

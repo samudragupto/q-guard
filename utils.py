@@ -3,7 +3,7 @@ import torch
 
 def get_device() -> torch.device:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device}")
+    print(f"[INFO] Using device: {device}", flush=True)
     return device
 
 def move_to_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
