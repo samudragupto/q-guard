@@ -1,20 +1,22 @@
 # eval/calibration.py
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
 
 class TemperatureScaling(nn.Module):
     def __init__(self):
         super().__init__()
-        self.temperature = nn.Parameter(torch.ones(1) * 1.5)
+        self.log_temperature = nn.Parameter(torch.zeros(1))
+
+    @property
+    def temperature(self) -> torch.Tensor:
+        return torch.exp(self.log_temperature).clamp(min=0.5, max=10.0)
 
     def forward(self, logits: torch.Tensor) -> torch.Tensor:
         return logits / self.temperature
 
     def fit(self, logits: torch.Tensor, labels: torch.Tensor, max_iter: int = 50, lr: float = 0.01):
-        optimizer = torch.optim.LBFGS([self.temperature], lr=lr, max_iter=20)
         criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.LBFGS([self.log_temperature], lr=lr, max_iter=20)
         
         for _ in range(max_iter):
             def closure():
@@ -23,8 +25,12 @@ class TemperatureScaling(nn.Module):
                 loss.backward()
                 return loss
             optimizer.step(closure)
+            
+    def get_calibrated_probs(self, logits: torch.Tensor) -> torch.Tensor:
+        return torch.softmax(self.forward(logits), dim=-1)
 
 def expected_calibration_error(y_true: torch.Tensor, probs: torch.Tensor, n_bins: int = 10) -> float:
+    import numpy as np
     confidences, predictions = probs.max(dim=-1)
     y_true_np, conf_np, pred_np = y_true.cpu().numpy(), confidences.cpu().numpy(), predictions.cpu().numpy()
     bin_boundaries = np.linspace(0, 1, n_bins + 1)
@@ -37,5 +43,6 @@ def expected_calibration_error(y_true: torch.Tensor, probs: torch.Tensor, n_bins
     return ece
 
 def brier_score(y_true: torch.Tensor, probs: torch.Tensor) -> float:
+    import torch.nn.functional as F
     y_true_one_hot = F.one_hot(y_true, num_classes=probs.shape[-1]).float()
     return torch.mean((probs - y_true_one_hot) ** 2).item()
