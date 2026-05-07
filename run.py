@@ -1,113 +1,106 @@
 # run.py
 import torch
-import pandas as pd
+import random
 import numpy as np
+import logging
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.utils.class_weight import compute_class_weight
+
 from data.data_loader import load_data, split_data
 from data.preprocess import clean_data, normalize_features, encode_target
 from data.feature_engineering import engineer_features, select_top_features
 from data.rebalance import rebalance_dataset
+from models.qguard_model import QGuardModel
 from training.train import train_model
-from training.losses import get_criterion
-from eval.calibration import expected_calibration_error, brier_score, TemperatureScaling, reliability_diagram_data
-from eval.adversarial import evaluate_robustness
-from eval.metrics import robust_evaluation
-from utils import get_device, move_to_device
+
+# Production Logging
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s [%(levelname)s] %(message)s", 
+    force=True
+)
+logger = logging.getLogger("Q-Guard")
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = True  # GPU Throughput Optimization
 
 def main():
-    device = get_device()
-
-    print("Loading data...", flush=True)
+    set_seed(42)
+    device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    logger.info("Loading data...")
     df = load_data("data.csv", sample_size=100000)
-    
-    print("Cleaning data...", flush=True)
     df = clean_data(df)
-    
-    print("Engineering features...", flush=True)
     df = engineer_features(df)
     
-    possible_targets = ['Attack Type', 'Label', 'Attack_Type']
-    target_col = next((col for col in possible_targets if col in df.columns), df.columns[-1])
-    print(f"[DEBUG] Target column found: '{target_col}'", flush=True)
-    
-    print("Encoding target labels...", flush=True)
+    target_col = next((c for c in ['Attack Type', 'Label', 'Attack_Type'] if c in df.columns), df.columns[-1])
     df, le = encode_target(df, target_col)
     num_classes = len(le.classes_)
     
-    print("Selecting top features...", flush=True)
     top_features = select_top_features(df, target_col, n_features=8)
     df, scaler = normalize_features(df, top_features)
-    
-    print("\nRebalancing dataset...", flush=True)
     df = rebalance_dataset(df, target_col, ratio=5)
     
     train_df, val_df, test_df = split_data(df, target_col)
     
-    X_train = move_to_device(torch.tensor(train_df[top_features].values, dtype=torch.float32), device)
-    y_train = move_to_device(torch.tensor(train_df[target_col].values, dtype=torch.long), device)
-    X_val = move_to_device(torch.tensor(val_df[top_features].values, dtype=torch.float32), device)
-    y_val = move_to_device(torch.tensor(val_df[target_col].values, dtype=torch.long), device)
-    X_test = move_to_device(torch.tensor(test_df[top_features].values, dtype=torch.float32), device)
-    y_test = move_to_device(torch.tensor(test_df[target_col].values, dtype=torch.long), device)
+    X_train = torch.tensor(train_df[top_features].values, dtype=torch.float32)
+    y_train = torch.tensor(train_df[target_col].values, dtype=torch.long)
+    X_val = torch.tensor(val_df[top_features].values, dtype=torch.float32)
+    y_val = torch.tensor(val_df[target_col].values, dtype=torch.long)
 
-    # Reduce class weight imbalance slightly (cap max weight to prevent overfitting on noise)
-    classes = np.unique(y_train.cpu().numpy())
-    weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train.cpu().numpy())
-    weights = np.clip(weights, 0.5, 5.0) 
-    class_weights = move_to_device(torch.tensor(weights, dtype=torch.float32), device)
-
-    print("\nStarting training...", flush=True)
-    model, optimal_threshold = train_model(
-        X_train, y_train, 
-        X_val, y_val, 
-        num_classes=num_classes,
-        epochs=30,
-        batch_size=64,  
-        lr=1e-3,
-        patience=7,
-        device=device,
-        class_weights=class_weights,
-        use_focal=True,
-        adv_training=True
+    # GPU-Optimized DataLoaders
+    train_loader = DataLoader(
+        TensorDataset(X_train, y_train), 
+        batch_size=256, 
+        shuffle=True, 
+        num_workers=4, 
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        TensorDataset(X_val, y_val), 
+        batch_size=256, 
+        shuffle=False, 
+        num_workers=4, 
+        pin_memory=True
     )
 
-    print("\nCalibrating model...", flush=True)
-    model.eval()
-    criterion = get_criterion(True, class_weights, device)
-    
-    with torch.no_grad():
-        logits = model(X_val)["logits"]
-        
-    temp_scaler = TemperatureScaling().to(device)
-    temp_scaler.fit(logits, y_val)
-    print(f"[DEBUG] Optimal Temperature: {temp_scaler.temperature.item():.4f}", flush=True)
-    
-    with torch.no_grad():
-        calibrated_probs = temp_scaler.get_calibrated_probs(logits)
-        ece = expected_calibration_error(y_val, calibrated_probs)
-        brier = brier_score(y_val, calibrated_probs)
-        rel_data = reliability_diagram_data(y_val, calibrated_probs)
-        
-    print(f"Calibration - ECE: {ece:.4f}, Brier Score: {brier:.4f}", flush=True)
-    print(f"Reliability Diagram Accuracy Bins: {rel_data['bin_accuracy']}", flush=True)
-    print(f"Reliability Diagram Confidence Bins: {rel_data['bin_confidence']}", flush=True)
-    
-    print("\nRunning adversarial robustness test (PGD)...", flush=True)
-    robustness_results = evaluate_robustness(model, X_val[:200], y_val[:200], device, threshold=optimal_threshold, eps=0.1)
-    print(f"Robustness - Clean Acc: {robustness_results['clean_accuracy']:.4f}, Adv Acc: {robustness_results['adversarial_accuracy']:.4f}", flush=True)
+    # Class Weights
+    classes = np.unique(y_train.numpy())
+    weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train.numpy())
+    class_weights = torch.tensor(np.clip(weights, 0.5, 5.0), dtype=torch.float32)
 
-    print("\nRunning robust evaluation on test set...", flush=True)
-    with torch.no_grad():
-        test_probs = model(X_test)["probs"]
-    eval_results = robust_evaluation(y_test, test_probs, le.classes_)
-    print(f"ROC-AUC: {eval_results['roc_auc']}", flush=True)
-    print(f"Classification Report:\n{eval_results['classification_report']}", flush=True)
+    # Model
+    model = QGuardModel(input_dim=len(top_features), num_classes=num_classes)
+
+    # Train (Unpacking 3 return values)
+    logger.info("Starting training...")
+    model, optimal_threshold, best_f1 = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        epochs=30,
+        lr=1e-3,
+        device=device_str,
+        class_weights=class_weights,
+        patience=7,
+        adv_training=True,
+        eps=0.03
+    )
+
+    # Fixed Logging: threshold and f1 are now separate floats
+    logger.info(f"Training complete. Optimal Threshold: {optimal_threshold:.4f} | Best F1: {best_f1:.4f}")
     
+    # Save Artifacts
     torch.save(model.state_dict(), "qguard_best.pth")
     torch.save(le.classes_, "label_classes.pth")
     torch.save(top_features, "feature_names.pth")
     torch.save(optimal_threshold, "optimal_threshold.pth")
-    print("\nArtifacts saved successfully.", flush=True)
+    logger.info("Artifacts saved successfully.")
 
 if __name__ == "__main__":
     main()

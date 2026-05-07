@@ -4,15 +4,12 @@ import numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel
 from models.qguard_model import QGuardModel
-from eval.explainability import get_shap_values
+from eval.explainability import explain_prediction
 
-app = FastAPI(title="Q-GUARD API")
+app = FastAPI(title="Q-GUARD SOC API")
 
 class FlowInput(BaseModel):
     features: list[float]
-
-class BatchFlowInput(BaseModel):
-    batch: list[FlowInput]
 
 class PredictionOutput(BaseModel):
     label: str
@@ -21,11 +18,12 @@ class PredictionOutput(BaseModel):
     threshold_used: float
 
 class ExplainOutput(BaseModel):
-    label: str
-    feature_importances: dict[str, float]
+    predicted_class: str
+    confidence: float
+    uncertainty: float
+    feature_contribution: dict[str, float]
 
 model = None
-background_data = None
 device = None
 label_classes = None
 feature_names = None
@@ -33,61 +31,46 @@ optimal_threshold = 0.5
 
 @app.on_event("startup")
 def load_model():
-    global model, background_data, device, label_classes, feature_names, optimal_threshold
+    global model, device, label_classes, feature_names, optimal_threshold
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
     label_classes = torch.load("label_classes.pth", weights_only=True)
     feature_names = torch.load("feature_names.pth", weights_only=True)
     try:
         optimal_threshold = torch.load("optimal_threshold.pth", weights_only=True)
     except FileNotFoundError:
         pass
-    
     model = QGuardModel(input_dim=len(feature_names), num_classes=len(label_classes)).to(device)
     try:
         model.load_state_dict(torch.load("qguard_best.pth", weights_only=True, map_location=device))
     except FileNotFoundError:
         pass
     model.eval()
-    background_data = torch.randn((20, len(feature_names)))
 
-@app.post("/predict", response_model=list[PredictionOutput])
-def predict(flow: BatchFlowInput):
-    x = torch.tensor([f.features for f in flow.batch], dtype=torch.float32).to(device)
+@app.post("/predict", response_model=PredictionOutput)
+def predict(flow: FlowInput):
+    x = torch.tensor([flow.features], dtype=torch.float32).to(device)
     with torch.no_grad():
-        output = model(x)
-    
-    results = []
-    for i in range(len(flow.batch)):
-        attack_prob = output["probs"][i][1].item()
-        pred = 1 if attack_prob >= optimal_threshold else 0
-        conf = output["probs"][i][pred].item()
-            
-        results.append(PredictionOutput(
-            label=label_classes[pred],
-            confidence=conf,
-            uncertainty=output["uncertainty"][i].item(),
-            threshold_used=optimal_threshold
-        ))
-    return results
+        out = model(x)
+    attack_prob = out["probs"][0][1].item()
+    pred = 1 if attack_prob >= optimal_threshold else 0
+    return PredictionOutput(
+        label=label_classes[pred],
+        confidence=out["probs"][0][pred].item(),
+        uncertainty=out["uncertainty"][0].item(),
+        threshold_used=optimal_threshold
+    )
 
-@app.post("/explain", response_model=list[ExplainOutput])
-def explain(flow: BatchFlowInput):
-    x = torch.tensor([f.features for f in flow.batch], dtype=torch.float32)
-    shap_values = get_shap_values(model, background_data, x, device)
-    
-    results = []
-    for i in range(len(flow.batch)):
-        pred = model(x[i].unsqueeze(0).to(device))["logits"].argmax(dim=-1).item()
-        importances = np.abs(shap_values[pred][i])
-        total = importances.sum()
-        norm_imp = (importances / total).tolist() if total > 0 else importances.tolist()
-        results.append(ExplainOutput(
-            label=label_classes[pred],
-            feature_importances=dict(zip(feature_names, norm_imp))
-        ))
-    return results
+@app.post("/explain", response_model=ExplainOutput)
+def explain(flow: FlowInput):
+    x = torch.tensor([flow.features], dtype=torch.float32)
+    res = explain_prediction(model, x, feature_names, device)
+    return ExplainOutput(
+        predicted_class=label_classes[res["predicted_class"]],
+        confidence=res["confidence"],
+        uncertainty=res["uncertainty"],
+        feature_contribution=res["feature_contribution"]
+    )
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "model_loaded": model is not None, "device": str(device)}
+    return {"status": "healthy", "device": str(device)}

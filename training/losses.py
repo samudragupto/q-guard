@@ -27,8 +27,8 @@ class FocalLoss(nn.Module):
             return focal_loss.sum()
         return focal_loss
 
-def get_criterion(use_focal: bool, class_weights: torch.Tensor = None, device: torch.device = torch.device("cpu"), label_smoothing: float = 0.05) -> nn.Module:
+def get_criterion(use_focal: bool, class_weights: torch.Tensor = None, device: torch.device = torch.device("cpu")) -> nn.Module:
     weights = class_weights.to(device) if class_weights is not None else None
     if use_focal:
-        return FocalLoss(alpha=weights, gamma=2.0, label_smoothing=label_smoothing).to(device)
-    return nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing).to(device)
+        return FocalLoss(alpha=weights, gamma=2.0, label_smoothing=0.05).to(device)
+    return nn.CrossEntropyLoss(weight=weights, label_smoothing=0.05).to(device)

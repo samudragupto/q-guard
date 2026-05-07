@@ -1,33 +1,71 @@
 # eval/metrics.py
 import torch
 import numpy as np
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve, precision_recall_curve
+import logging
+from sklearn.metrics import f1_score, precision_recall_curve
 
-def robust_evaluation(y_true: torch.Tensor, probs: torch.Tensor, class_names: list) -> dict:
-    y_true_np = y_true.cpu().numpy()
-    preds_np = probs.argmax(dim=-1).cpu().numpy()
-    probs_np = probs.cpu().numpy()
+logger = logging.getLogger(__name__)
+
+def _to_numpy(tensor: torch.Tensor) -> np.ndarray:
+    """Safely convert CUDA/CPU tensor to NumPy array without gradient leakage."""
+    if isinstance(tensor, torch.Tensor):
+        return tensor.detach().cpu().numpy()
+    return np.array(tensor)
+
+def optimize_threshold(
+    y_true: torch.Tensor, 
+    probs: torch.Tensor, 
+    start: float = 0.1, 
+    end: float = 0.9, 
+    step: float = 0.01
+) -> tuple[float, float]:
+    """
+    Find the optimal decision threshold maximizing the F1-score.
+    Uses vectorized operations and handles edge cases safely.
     
-    report = classification_report(y_true_np, preds_np, target_names=class_names, output_dict=True)
-    cm = confusion_matrix(y_true_np, preds_np)
+    Returns:
+        tuple[float, float]: (optimal_threshold, best_f1_score)
+    """
+    y_true_np = _to_numpy(y_true)
+    probs_np = _to_numpy(probs)
     
-    results = {
-        "classification_report": report,
-        "confusion_matrix": cm.tolist()
-    }
-    
-    try:
-        if len(class_names) == 2:
-            auc = roc_auc_score(y_true_np, probs_np[:, 1])
-            fpr, tpr, roc_thresh = roc_curve(y_true_np, probs_np[:, 1])
-            precision, recall, pr_thresh = precision_recall_curve(y_true_np, probs_np[:, 1])
-            results["roc_auc"] = auc
-            results["roc_curve"] = {"fpr": fpr.tolist(), "tpr": tpr.tolist()}
-            results["pr_curve"] = {"precision": precision.tolist(), "recall": recall.tolist()}
-        else:
-            auc = roc_auc_score(y_true_np, probs_np, multi_class='ovr')
-            results["roc_auc"] = auc
-    except ValueError:
-        results["roc_auc"] = None
+    # Validation: Empty inputs
+    if len(y_true_np) == 0 or len(probs_np) == 0:
+        logger.warning("Empty inputs provided to optimize_threshold. Returning default (0.5, 0.0).")
+        return 0.5, 0.0
         
-    return results
+    assert len(y_true_np) == len(probs_np), "y_true and probs length mismatch"
+    
+    # Handle binary classification (extract probability of class 1)
+    if probs_np.ndim == 2 and probs_np.shape[1] == 2:
+        probs_np = probs_np[:, 1]
+    elif probs_np.ndim == 2:
+        logger.warning("Multi-class probabilities detected. Threshold optimization skipped.")
+        return 0.5, 0.0
+        
+    # Validation: NaN probabilities
+    if np.isnan(probs_np).any():
+        logger.warning("NaN probabilities detected. Replacing with 0.5.")
+        probs_np = np.nan_to_num(probs_np, nan=0.5)
+
+    # Vectorized threshold search
+    thresholds = np.arange(start, end, step)
+    best_threshold = 0.5
+    best_f1 = 0.0
+    
+    for t in thresholds:
+        preds = (probs_np >= t).astype(int)
+        if preds.sum() == 0:
+            continue
+        f1 = f1_score(y_true_np, preds, average="binary", zero_division=0)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = float(t)
+
+    # Validation: NaN threshold
+    if np.isnan(best_threshold):
+        logger.warning("NaN threshold detected. Defaulting to 0.5.")
+        best_threshold = 0.5
+            
+    logger.info(f"Optimal threshold found: {best_threshold:.4f} (F1: {best_f1:.4f})")
+    return best_threshold, best_f1
