@@ -1,10 +1,17 @@
-# requirements.txt
 torch
-scikit-learn
-pandas
+torchvision
+torchaudio
 numpy
+pandas
+scikit-learn
+matplotlib
+seaborn
+shap
 fastapi
 uvicorn
-pydantic
-shap
-matplotlib
+onnx
+onnxruntime
+joblib
+tqdm
+imbalanced-learn
+scipy

@@ -1,23 +1,15 @@
 import torch
 import torch.nn as nn
 
-def pgd_attack(model: nn.Module, X: torch.Tensor, y: torch.Tensor, criterion: nn.Module, eps: float = 0.03, alpha: float = 0.007, iters: int = 3) -> torch.Tensor:
-    model.eval() # Ensure batchnorm/dropout are stable during attack generation
+def pgd_attack(model: nn.Module, X: torch.Tensor, y: torch.Tensor, criterion: nn.Module, device: torch.device, eps: float = 0.03, alpha: float = 0.007, iters: int = 3) -> torch.Tensor:
+    model.eval()
     X_adv = X.clone().detach()
-    
     for _ in range(iters):
         X_adv.requires_grad_(True)
-        outputs = model(X_adv)
-        loss = criterion(outputs["logits"], y)
+        loss = criterion(model(X_adv)["logits"], y)
         loss.backward()
-        
-        # Use data.grad to avoid graph retention issues
-        X_adv = X_adv + alpha * X_adv.grad.sign()
-        # Projection step
-        X_adv = torch.max(torch.min(X_adv, X + eps), X - eps)
-        X_adv = X_adv.detach()
-        
-    model.train() # Reset to train mode for continued training
+        X_adv = torch.max(torch.min(X_adv + alpha * X_adv.grad.sign(), X + eps), X - eps).detach()
+    model.train()
     return X_adv
 
 def evaluate_robustness(model: nn.Module, X: torch.Tensor, y: torch.Tensor, device: torch.device, criterion: nn.Module, threshold: float = 0.5, eps: float = 0.1) -> dict:
